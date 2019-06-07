@@ -1,0 +1,542 @@
+#!/usr/bin/env perl
+
+# Copyright (c) 2008-2014, Kurt D. Starsinic <kstarsinic@gmail.com>
+# Patches welcome.
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the Artistic License 2.0.
+#
+# This program is distributed in the hope that it will be useful, but it is
+# provided "as is" and without any express or implied warranties.
+
+# For details, see the full text of the license at
+# <http://www.perlfoundation.org/artistic_license_2_0>.
+
+# This program is short on documentation.  This shall be remedied in the
+# upcoming release.
+
+# Basic usage:
+#
+# dus.pl [followed by any arguments you would pass to du(1) on your system]
+#
+# The "Page Up" and "Page Down" keys will do what you expect.
+# At any time you can press "h" for help, "q" to quit, or 'r' to restart
+# (e.g., after you've deleted some files).
+#
+# NOTE:  It is assumed that your system's du(1), as called with the parameters
+# you pass, returns lines in the format /^([0-9]+)\s+(.+)/, where $1 is the
+# size of the directory (in any consistent units) and $2 is the name of the directory.
+#
+# In particular, the output of "du -h" or "du --si" (which outputs sizes as a number
+# followed by units, e.g., "44K" or "1.4G") will not be properly handled by dus.
+
+# TODO:
+#   Implement help
+#   Add a "find" mode
+#   Allow left/right scrolling
+#   Allow drill down to files in directory
+#       Allow delete and shell-out in directory
+#   Proper STDERR handler (e.g., an alternate screen)
+#   Allow expand/collapse of subdirectories
+#   Customization:
+#     Colors (per-terminal)?
+#     Perl expressions
+
+use strict;
+use warnings; no warnings 'numeric', 'once';
+
+require File::Spec;
+
+require Curses;
+my $W = begin_curses();
+
+
+### %Du and @Du are the master data structures.
+###
+### There is one entry in %Du for every directory we've seen so far, and all
+### of those directories' parent directories, all the way up to the top of
+### the hierarchy we're doing a "du" on.  The keys of %Du are directory names,
+### and the values are array references.
+###
+### The first element of the array is the directory's size -- either estimated
+### or actual.
+###
+### If there are *any* following elements, they are the names of the
+### directory's subdirectories that we've seen so far (and the first entry is
+### an *estimated* size).
+###
+### If there are *no* following elements, then the first element is the
+### *actual* size of the directory.
+###
+### There is one line in @Du for every line displayed on the screen.  Each
+### element of @Du is a directory name.  @Du is always sorted in size order.
+my (%Du, @Du, $Tot);
+
+
+
+# TODO:  Get smarter about identifying non-option args.
+$_ = File::Spec->canonpath($_) for grep { not /^-/ } @ARGV; # Canonicalize non-option args:
+
+my $NumWidth  = 7;
+my $TopLineNum = 0;
+my (%RootDirs, %Marked, $Watched);
+my %Collapsed;
+my $Message = '';
+my $CursorY = 0;
+my $Status;
+my %Mode  = (
+  Paused      => 0,
+  AutoReload  => 0,
+);
+my $du;
+
+RELOAD:
+$Status = '';
+$Mode{Paused} = 0;
+$Du{$_} = [ undef ] for keys %Du;
+my $CursorFile = undef;
+close $du if $du;
+
+### Figure out which of our command line arguments are directory names.
+### Create an entry in %Du for each of them, and tag them as "root" nodes.
+my @dirs = grep { not /^-/ } @ARGV;
+foreach my $arg (@dirs ? @dirs : '.') {
+  $RootDirs{File::Spec->canonpath($arg)} = 1;
+}
+
+
+sub message { $Message = $_[0] }
+message();
+my %Handler = (
+  Curses::KEY_NPAGE() => [ 'page down',                         sub { pc_scroll(+1) } ],
+  Curses::KEY_PPAGE() => [ 'page up',                           sub { pc_scroll(-1) } ],
+
+  k                   => [ 'up',                                sub { pc_move(-1) } ],
+  j                   => [ 'down',                              sub { pc_move(+1) } ],
+  Curses::KEY_UP()    => 'k',
+  Curses::KEY_DOWN()  => 'j',
+
+  m                   => [ 'mark',                              \&mark ],
+  w                   => [ 'watch (keep directory on-screen)',  \&watch ],
+  '-'                 => [ 'collapse (TODO)',                   \&collapse ],
+  '+'                 => [ 'expand (TODO)',                     \&expand ],
+
+  r                   => [ 'reload',                            sub { goto RELOAD } ],
+  R                   => [ 'toggle autoreload',                 toggle_mode_functor('AutoReload') ],
+
+  q                   => [ 'quit',                              sub { end_curses(); exit } ],
+
+  h                   => [ 'help',                              \&help ],
+  '?'                 => 'h',
+
+  ' '                 => [ 'toggle display pause',              toggle_mode_functor('Paused') ],
+);
+
+### The main loop:
+### Call "du", passing along the arguments we were called with.  For each line
+### of output from "du", update the data structures and re-paint the screen.
+my $deadline;
+my $reload_time = 30; # TODO make this configurable
+open $du, '-|', 'du', @ARGV;
+while (1) {
+  if (eof($du)) {
+    if ($Status ne 'done') {
+      $Status = 'done';
+      close($du);
+      $deadline = time() + $reload_time;
+    }
+
+    if ($Mode{AutoReload}) {
+      my $seconds = $deadline - time(); 
+      if ($seconds > 0) {
+        message("Reload in $seconds seconds");
+      } else {
+        goto RELOAD;
+      }
+    } else {
+      message('');
+      $deadline = time() + $reload_time;
+    }
+  } elsif (not $Mode{Paused}) {
+    my ($n, $s) = (<$du> =~ /^([0-9]+)\s+(.+)/);
+    $s = File::Spec->canonpath($s);
+    @{ $Du{$s} }    = ( $n );
+
+    remove($s); # Take the entries for $s and its parents out of @Du
+    bubble($s); # Put them back, in their new correct locations
+    $Tot = scalar keys %Du; # TODO Can we get more efficient about calculating $Tot?
+  }
+
+  draw_screen();
+  process_input();
+}
+
+exit;
+
+
+sub draw_screen {
+  # If we're watching a directory, and we're currently processing "du" output,
+  # then let's make sure that our watched directory remains on-screen, and
+  # let's keep the cursor pointing at it:
+  if (defined $Watched and not $Mode{Paused} and $Status ne 'done') {
+    foreach my $i (0 .. $#Du) {
+      if ($Du[$i] eq $Watched) {
+        if    ($i < $TopLineNum)       { pc_scroll(0, $i - $TopLineNum) }
+        elsif ($i > bottom_line_num()) { pc_scroll(0, $i - bottom_line_num()) }
+
+        $CursorY = $i - $TopLineNum;
+        last;
+      }
+    }
+  }
+
+  ### Draw all the lines with fileinfo:
+  my @lines = build_output_lines();
+  foreach my $i (0 .. $#lines) {
+    my ($attrs, $string) = @{ $lines[$i] };
+    add_attr_string($attrs, $i, 0, $string);
+  }
+
+  ### Draw the status line on the last row:
+  show_status();
+
+  ### Wipe up the tiny little bit that's left:
+  $W->clrtobot;
+
+  ### Draw the upper right hand corner last,
+  ### because that interacts best with the way we draw the rest of the screen:
+  my $hdr = length($Message) ? "[$Message] " : "";
+  my ($top, $bot) = (1+$TopLineNum, 1+$TopLineNum+$#lines);
+  $hdr .= " $top -- $bot of $Tot              ";
+  if (my @modes = sort grep { $Mode{$_} } keys %Mode) {
+    $hdr .= " (@modes)";
+  }
+  add_attr_string(1, 0, $Curses::COLS-length($hdr)-5, $hdr);
+
+  $W->refresh;
+}
+
+
+sub build_output_lines {
+  my @lines;
+
+  $CursorFile = $Du[$CursorY + $TopLineNum];
+
+  foreach my $y (0 .. c_files_per_page() - 1) {
+    my $i = $y + $TopLineNum;
+    last if $i > $#Du;
+
+    my $path = $Du[$i];
+    my $attrs;
+
+    if    ($Marked{$path})    { $attrs = 3 }
+    elsif ($RootDirs{$path})  { $attrs = 1 }
+    elsif ($#{ $Du{$path} })  { $attrs = 0 } # size is a running estimate
+    else                      { $attrs = 2 }
+
+    my $size      = $Du{$path}[0];
+    my $c         = ($y == $CursorY) ? ($Collapsed{$path} ? '}' : '>') : ($Collapsed{$path} ? '-' : ' ');
+    my $fileinfo  = sprintf "%1.1s%s %-*s", $c, formatted_size($size), $Curses::COLS, $path;
+
+    push @lines, [ $attrs, $fileinfo ];
+  }
+
+  return @lines;
+}
+
+
+### Given the newly-arrived entry for $here, insert it into the proper slot in @Du.  Then re-calculate
+### $here's parent directory's size, and recurse up the directory tree until we hit a root node.
+### TODO:  honor %Collapsed
+sub bubble {
+  my ($here)  = @_;
+  my @split   = File::Spec->splitdir(File::Spec->canonpath($here));
+  pop @split if @split > 1;
+  my $dotdot  = File::Spec->catdir(@split);
+
+  # Update the parent directory's entry, unless we're at the root of a tree:
+  if (not $RootDirs{$here} and $here ne $dotdot) {
+    if (not $Du{$dotdot}) {                                                         # We've never even seen $dotdot before
+      $Du{$dotdot} = [ $Du{$here}[0], $here ];
+    } elsif (not grep { $_ eq $here } @{ $Du{$dotdot} }[1 .. $#{ $Du{$dotdot} }]) { # We've never seen $here before
+      $Du{$dotdot}[0] += $Du{$here}[0];
+      push @{ $Du{$dotdot} }, $here;
+    } else {                                                                        # Update our estimated size for $here
+      $Du{$dotdot}[0]  = 0;
+      $Du{$dotdot}[0] += $Du{$_}[0] for @{ $Du{$dotdot} }[1 .. $#{ $Du{$dotdot} }];
+    }
+  }
+
+  # Find the entry to insert $here after:
+  my $size = $Du{$here}[0];
+  my $i;
+  for ($i = $#Du; $i >= 0; $i--) {
+    my $path   = $Du[$i];
+    my $test  = (defined $Du{$path}[0]) ? $Du{$path}[0] : 0;
+
+    last if ($test  > $size);                     # Primary sort key:  size descending
+    last if ($test == $size) && ($path lt $here); # Secondary sort key:  pathname ascending
+  }
+
+  # Now insert $here into @Du.  If we made it all the way through the above loop without finding
+  # a place for it, then $i is -1, and we'll insert $here at the beginning of the array:
+  splice @Du, $i+1, 0, $here;
+
+  # Keep @Du from growing without bound, because splice() doesn't scale.
+  # XXX We should be able to keep @Du usually very small, but rebuild it on
+  # the fly when the user pages down
+  pop @Du if (@Du > 500 && @Du > $TopLineNum + c_files_per_page() + 1);  # XXX Is 500 the right number?
+
+  bubble($dotdot) if ((not $RootDirs{$here}) and $here ne $dotdot);       # Lather, rinse, repeat
+
+  $NumWidth = maxdef($NumWidth, length $Du{$Du[0]}[0]);
+}
+
+
+### Page/Cursor related functions
+sub pc_move { # Move the cursor $num_lines; return value indicates whether we've hit the wall
+  my ($num_lines) = @_;
+
+  $CursorY += $num_lines;
+
+  if ($CursorY < c_min_y()) {
+    $TopLineNum   = $TopLineNum - c_min_y() + $CursorY;
+
+    if ($TopLineNum < 0) {
+      $TopLineNum = 0;
+      Curses::beep();
+    }
+
+    $CursorY      = c_min_y();
+
+    return($TopLineNum != 0);
+  } elsif ($CursorY > c_max_y()) {
+    my $max_top_line = $Tot - c_files_per_page();
+    $TopLineNum   = $TopLineNum - c_max_y() + $CursorY;
+
+    if ($TopLineNum > $max_top_line) {
+      $TopLineNum = $max_top_line;
+      Curses::beep();
+    }
+
+    $CursorY      = c_max_y();
+
+    return($TopLineNum != $max_top_line);
+  }
+
+  return 1;
+}
+
+sub pc_scroll {
+  my ($num_pages, $num_lines) = @_;
+
+  if ($num_pages) {
+    $TopLineNum += ($num_pages * c_files_per_page());
+  }
+
+  if ($num_lines) {
+    $TopLineNum += $num_lines;
+    $CursorY     = mindef(maxdef($CursorY - $num_lines, c_min_y()), c_max_y());
+  }
+
+  # TODO:  If we're going to tweak $TopLineNum now, then let's tweak $CursorY in the other direction
+  my $max_top_line = $Tot - c_files_per_page();
+  if ($TopLineNum < 0) {
+    $TopLineNum = 0;
+    Curses::beep();
+    return 0;
+  } elsif ($TopLineNum > $max_top_line) {
+    $TopLineNum = $max_top_line;
+    Curses::beep();
+    return 0;
+  }
+
+  return 1;
+}
+
+sub c_min_y { 0 }                   # min row for the cursor (also top-of-screen)
+sub c_max_y { $Curses::LINES - 2 }  # max row for the cursor (one line above bottom-of-screen)
+sub c_files_per_page { $Curses::LINES - 1 }
+
+
+sub bottom_line_num { $TopLineNum + c_files_per_page() - 1 }
+
+### END Page related functions
+
+sub maxdef {
+  if (@_) {
+    my $max;
+
+    foreach my $val (map { defined($_) ? $_ : 0 } @_) {
+      $max = $val if (not defined $max or $val > $max);
+    }
+
+    return $max;
+  }
+
+  return 0;
+}
+
+sub mindef {
+  if (@_) {
+    my $min;
+
+    foreach my $val (map { defined($_) ? $_ : 0 } @_) {
+      $min = $val if (not defined $min or $val < $min);
+    }
+
+    return $min;
+  }
+
+  return 0;
+}
+
+
+sub remove {
+  my ($path)  = @_;
+
+  # Remove $here from @Du, if present:
+  @Du = grep { $_ ne $path } @Du;
+
+  # Now remove its parent directory, unless we're at the top of our tree:
+  # TODO:  Use File::Spec to inspect $path
+  if (not $RootDirs{$path} and $path =~ s:/[^/]*$::) {
+    remove($path);
+  }
+}
+
+
+sub process_input {
+  while ((my $char = $W->getch) ne Curses::ERR()) { # There was input
+    if (my $handler = handler_for_char($char)) {
+      #message($handler->[0]) if defined $handler->[0];
+      $handler->[1]->();
+    } else {
+      Curses::beep();
+      #message("<$char>");
+    }
+  }
+}
+
+
+sub handler_for_char {
+  my ($char) = @_;
+
+  if (my $handler = $Handler{$char}) {
+    $handler = $Handler{$handler} while not ref $handler; # Key alias dereferencing
+    return $handler;
+  }
+
+  return;
+}
+
+
+sub mark { $Marked{$CursorFile} = not $Marked{$CursorFile} }
+
+
+sub watch {
+  if ($Watched and $Watched eq $CursorFile) {
+    undef $Watched;
+  } else {
+    $Watched = $CursorFile;
+  }
+
+  mark();
+}
+
+
+sub collapse  { $Collapsed{$CursorFile} = 1 }
+sub expand    { $Collapsed{$CursorFile} = 0 }
+
+
+sub help {
+  end_curses();
+
+  my %map = (
+    Curses::KEY_NPAGE() => 'PgDn',
+    Curses::KEY_PPAGE() => 'PdUp',
+    Curses::KEY_UP()    => 'Up',
+    Curses::KEY_DOWN()  => 'Dn',
+    ' '                 => 'Spc',
+  );
+
+  print "$0:  show du(1) output sorted in a curses window.\n";
+  print "--- key bindings ---\n";
+  foreach my $char (sort keys %Handler) {
+    my $handler = handler_for_char($char);
+    my $show    = $map{$char} || $char;
+    printf "  %-4s %s\n", $show, $handler->[0];
+  }
+
+  exit;
+}
+
+
+sub toggle_mode_functor { my ($m) = @_; sub { $Mode{$m} = not $Mode{$m} } }
+
+
+sub formatted_size { defined($_[0]) ? sprintf("%*d", $NumWidth, $_[0]) : sprintf("%*s", $NumWidth, '-') }
+
+
+my @Colors;
+sub begin_curses {
+  close STDERR;
+  #open STDERR, '>', "STDERR.txt";
+  my $w = Curses->new;
+
+  Curses::start_color();
+
+  my $bg = Curses::COLOR_BLUE();
+  Curses::init_pair(1, Curses::COLOR_CYAN(),   $bg);
+  Curses::init_pair(2, Curses::COLOR_YELLOW(), $bg);
+  Curses::init_pair(3, Curses::COLOR_WHITE(),  $bg);
+  Curses::init_pair(4, Curses::COLOR_GREEN(),  $bg);
+  Curses::assume_default_colors(Curses::COLOR_WHITE(), $bg);
+
+  @Colors = (
+    Curses::COLOR_PAIR(1) | Curses::A_BOLD(),
+    Curses::COLOR_PAIR(2) | Curses::A_BOLD(),
+    Curses::COLOR_PAIR(3) | Curses::A_BOLD(),
+    Curses::COLOR_PAIR(4) | Curses::A_BOLD(),
+  );
+
+  $w->nodelay(1);
+  $w->keypad(1);
+  Curses::noecho();
+
+  return $w;
+}
+
+
+sub add_attr_string {
+  my ($attr, $y, $x, $string) = @_;
+  $W->attrset($Colors[$attr]);
+  $W->addstr($y, $x, $string);
+}
+
+
+sub show_status {
+  if ($Status and length $Status) {
+    my $status = $Status;
+
+    $status = "  $status  ";
+    # The maximum "safe" length of a string on the bottom row is $Curses::COLS-1.
+    # If we go all the way to the bottom-right cell, many terminals will wrap
+    # the cursor and scroll everything up one line.
+    #
+    # This will leave a space in the rightmost column . . .
+    $status = "-$status-" while length $status < $Curses::COLS-4;
+    # . . . so we'll add an extra space in the leftmost column for symmetry.
+    $status = " $status";
+
+    add_attr_string(1, $Curses::LINES - 1, 0, $status);
+  }
+}
+
+
+sub end_curses {
+  Curses::endwin();
+  die "end_curses:  @_" if @_;
+}
+
+
