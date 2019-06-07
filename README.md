@@ -23,3 +23,5 @@ Export:
   Curses
   PerlClass
 
+test
+
